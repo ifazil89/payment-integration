@@ -1,0 +1,19 @@
+{
+  "reference": "order-ref-1",
+  "action": "PURCHASE",
+  "_embedded": {
+    "payment": [
+      {
+        "reference": "pay-ref-1",
+        "orderReference": "order-ref-1",
+        "state": "PURCHASED",
+        "amount": { "currencyCode": "AED", "value": 100 },
+        "authResponse": { "authorizationCode": "AB0012", "success": true, "resultCode": "00" },
+        "_links": {
+          "self": { "href": "{{BASE}}/transactions/outlets/outlet-1/orders/order-ref-1/payments/pay-ref-1" },
+          "cnp:refund": { "href": "{{BASE}}/transactions/outlets/outlet-1/orders/order-ref-1/payments/pay-ref-1/captures/cap-1/refund" }
+        }
+      }
+    ]
+  }
+}

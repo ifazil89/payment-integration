@@ -1,0 +1,16 @@
+{
+  "reference": "pay-ref-1",
+  "orderReference": "order-ref-1",
+  "state": "AWAIT_3DS",
+  "3ds2": {
+    "eci": "02",
+    "transStatus": "C",
+    "messageVersion": "2.1.0",
+    "acsReferenceNumber": "00001ACS00001",
+    "threeDSServerTransID": "server-trans-1",
+    "acsURL": "https://acs.example/challenge",
+    "acsTransID": "acs-trans-1",
+    "directoryServerID": "M000000004",
+    "base64EncodedCReq": "eyJ..."
+  }
+}

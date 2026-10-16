@@ -1,0 +1,22 @@
+{
+  "_id": "urn:payment:pay-ref-1",
+  "reference": "pay-ref-1",
+  "orderReference": "order-ref-1",
+  "outletId": "outlet-1",
+  "state": "AWAIT_3DS",
+  "paymentMethod": { "name": "VISA", "pan": "230377******0408", "expiry": "2029-01", "cardholderName": "John Brown" },
+  "amount": { "currencyCode": "AED", "value": 100 },
+  "3ds2": {
+    "messageVersion": "2.1.0",
+    "threeDSMethodURL": "https://acs.example/method",
+    "threeDSServerTransID": "server-trans-1",
+    "directoryServerID": "M000000004"
+  },
+  "_links": {
+    "self": { "href": "{{BASE}}/transactions/outlets/outlet-1/orders/order-ref-1/payments/pay-ref-1" },
+    "cnp:3ds2-authentication": { "href": "{{BASE}}/transactions/outlets/outlet-1/orders/order-ref-1/payments/pay-ref-1/card/3ds2/authentications" },
+    "cnp:3ds2-challenge-response": { "href": "{{BASE}}/transactions/outlets/outlet-1/orders/order-ref-1/payments/pay-ref-1/card/3ds2/challenge-response" },
+    "cnp:3ds": { "href": "{{BASE}}/transactions/outlets/outlet-1/orders/order-ref-1/payments/pay-ref-1/card/3ds" }
+  },
+  "someFutureField": { "ignored": true }
+}

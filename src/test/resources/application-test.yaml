@@ -1,0 +1,12 @@
+ni:
+  base-url: http://localhost:9
+  api-key: test-api-key
+  outlet-ref: test-outlet
+  webhook:
+    header-value: test-webhook-secret
+
+payments:
+  public-base-url: http://localhost:8080
+  return-url: http://localhost:3000/payment-result
+  reconciliation:
+    enabled: false

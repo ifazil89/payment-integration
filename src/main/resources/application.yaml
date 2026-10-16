@@ -1,0 +1,61 @@
+spring:
+  application:
+    name: payment-integration
+  elasticsearch:
+    uris: ${ELASTICSEARCH_URIS:http://localhost:9200}
+  threads:
+    virtual:
+      enabled: true
+  task:
+    execution:
+      thread-name-prefix: payments-async-
+      simple:
+        # Bounds concurrent webhook processing so a burst cannot exhaust Elasticsearch or N-Genius limits.
+        concurrency-limit: 50
+    scheduling:
+      thread-name-prefix: payments-scheduler-
+
+server:
+  # Trust X-Forwarded-* from the load balancer so the shopper IP sent for 3DS is the real one.
+  forward-headers-strategy: framework
+  shutdown: graceful
+
+ni:
+  base-url: ${NI_BASE_URL:https://api-gateway.sandbox.ngenius-payments.com}
+  api-key: ${NI_API_KEY}
+  outlet-ref: ${NI_OUTLET_REF}
+  order-action: PURCHASE
+  connect-timeout: 5s
+  read-timeout: 30s
+  token-refresh-margin: 60s
+  retry:
+    max-retries: 2
+    initial-delay: 300ms
+    multiplier: 2.0
+  webhook:
+    header-name: ${NI_WEBHOOK_HEADER_NAME:X-NI-Webhook-Secret}
+    header-value: ${NI_WEBHOOK_SECRET}
+
+payments:
+  public-base-url: ${PAYMENTS_PUBLIC_BASE_URL}
+  return-url: ${PAYMENTS_RETURN_URL}
+  reconciliation:
+    enabled: ${PAYMENTS_RECONCILIATION_ENABLED:true}
+    interval: 60s
+    recheck-after: 2m
+    give-up-after: 24h
+    batch-size: 50
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+logging:
+  pattern:
+    correlation: "[%X{correlationId:-}] "

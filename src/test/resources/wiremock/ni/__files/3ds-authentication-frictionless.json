@@ -1,0 +1,7 @@
+{
+  "reference": "pay-ref-1",
+  "orderReference": "order-ref-1",
+  "state": "PURCHASED",
+  "authResponse": { "authorizationCode": "AB0012", "success": true, "resultCode": "00" },
+  "3ds2": { "transStatus": "Y", "messageVersion": "2.1.0" }
+}
