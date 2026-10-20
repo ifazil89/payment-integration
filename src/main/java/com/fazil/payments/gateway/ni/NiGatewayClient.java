@@ -25,14 +25,13 @@ import lombok.extern.slf4j.Slf4j;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.json.JsonMapper;
 
-import org.springframework.core.retry.RetryTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.web.client.RestClient;
 
 /**
  * N-Genius one-stage Direct API adapter. Every follow-up call uses the {@code _links} hrefs N-Genius returned;
  * only the entry points (payment, order lookup) are built from configuration. Authentication is added by
- * {@link NiBearerTokenInterceptor}, error translation by {@link NiErrorTranslator}.
+ * {@link NiBearerTokenInterceptor}; circuit breaking, retries and error translation by {@link NiCallExecutor}.
  */
 @Slf4j
 @RequiredArgsConstructor
@@ -48,13 +47,13 @@ class NiGatewayClient implements PaymentGateway {
 
 	private final NiPaymentMapper mapper;
 
-	private final RetryTemplate retryTemplate;
+	private final NiCallExecutor calls;
 
 	private final JsonMapper jsonMapper;
 
 	@Override
 	public GatewayPaymentResult createPayment(GatewayPaymentRequest request) {
-		NiPaymentResponse response = NiErrorTranslator.execute("create-payment", () -> this.restClient.post()
+		NiPaymentResponse response = this.calls.call("create-payment", () -> this.restClient.post()
 			.uri(CREATE_PAYMENT_URI, this.properties.outletRef())
 			.contentType(NiMediaTypes.PAYMENT_V2)
 			.accept(NiMediaTypes.PAYMENT_V2)
@@ -67,7 +66,7 @@ class NiGatewayClient implements PaymentGateway {
 	@Override
 	public GatewayPaymentResult authenticate3ds(GatewayLinks links, BrowserInfo browser, String notificationUrl) {
 		URI href = requireLink(links.threeDsAuthentication(), "3ds-authentication");
-		NiPaymentResponse response = NiErrorTranslator.execute("3ds-authentication", () -> this.restClient.post()
+		NiPaymentResponse response = this.calls.call("3ds-authentication", () -> this.restClient.post()
 			.uri(href)
 			.contentType(NiMediaTypes.PAYMENT_V2)
 			.body(this.mapper.toAuthenticationRequest(browser, notificationUrl))
@@ -83,7 +82,7 @@ class NiGatewayClient implements PaymentGateway {
 	@Override
 	public GatewayPaymentResult completeChallenge(GatewayLinks links, String cres) {
 		URI href = requireLink(links.threeDsChallengeResponse(), "3ds-challenge-response");
-		NiPaymentResponse response = NiErrorTranslator.execute("3ds-challenge-response", () -> this.restClient.post()
+		NiPaymentResponse response = this.calls.call("3ds-challenge-response", () -> this.restClient.post()
 			.uri(href)
 			.contentType(NiMediaTypes.PAYMENT_V2)
 			.body(new NiChallengeResponseRequest(cres))
@@ -94,11 +93,10 @@ class NiGatewayClient implements PaymentGateway {
 
 	@Override
 	public GatewayPaymentResult getOrder(String orderReference) {
-		NiOrderResponse order = this.retryTemplate
-			.invoke(() -> NiErrorTranslator.execute("get-order", () -> this.restClient.get()
-				.uri(ORDER_URI, this.properties.outletRef(), orderReference)
-				.retrieve()
-				.body(NiOrderResponse.class)));
+		NiOrderResponse order = this.calls.callIdempotent("get-order", () -> this.restClient.get()
+			.uri(ORDER_URI, this.properties.outletRef(), orderReference)
+			.retrieve()
+			.body(NiOrderResponse.class));
 		NiPaymentResponse payment = order.firstPayment();
 		if (payment == null) {
 			log.warn("N-Genius order {} has no embedded payment", orderReference);
@@ -110,7 +108,7 @@ class NiGatewayClient implements PaymentGateway {
 	@Override
 	public GatewayPaymentResult refund(GatewayLinks links, Money amount) {
 		URI href = requireLink(links.refund(), "refund");
-		NiPaymentResponse response = NiErrorTranslator.execute("refund", () -> this.restClient.post()
+		NiPaymentResponse response = this.calls.call("refund", () -> this.restClient.post()
 			.uri(href)
 			.contentType(NiMediaTypes.PAYMENT_V2)
 			.accept(NiMediaTypes.PAYMENT_V2)

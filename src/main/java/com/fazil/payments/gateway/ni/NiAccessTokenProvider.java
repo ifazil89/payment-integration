@@ -9,7 +9,6 @@ import com.fazil.payments.gateway.exception.GatewayUnavailableException;
 import com.fazil.payments.gateway.ni.dto.NiAccessTokenResponse;
 import lombok.extern.slf4j.Slf4j;
 
-import org.springframework.core.retry.RetryTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.web.client.RestClient;
 
@@ -28,7 +27,7 @@ class NiAccessTokenProvider {
 
 	private final NiProperties properties;
 
-	private final RetryTemplate retryTemplate;
+	private final NiCallExecutor calls;
 
 	private final Clock clock;
 
@@ -36,11 +35,10 @@ class NiAccessTokenProvider {
 
 	private volatile CachedToken cached;
 
-	NiAccessTokenProvider(RestClient identityClient, NiProperties properties, RetryTemplate retryTemplate,
-			Clock clock) {
+	NiAccessTokenProvider(RestClient identityClient, NiProperties properties, NiCallExecutor calls, Clock clock) {
 		this.identityClient = identityClient;
 		this.properties = properties;
-		this.retryTemplate = retryTemplate;
+		this.calls = calls;
 		this.clock = clock;
 	}
 
@@ -77,13 +75,12 @@ class NiAccessTokenProvider {
 	}
 
 	private CachedToken fetch() {
-		NiAccessTokenResponse response = this.retryTemplate
-			.invoke(() -> NiErrorTranslator.execute(OPERATION, () -> this.identityClient.post()
-				.uri(TOKEN_URI)
-				.header(HttpHeaders.AUTHORIZATION, "Basic " + this.properties.apiKey())
-				.contentType(NiMediaTypes.IDENTITY_V1)
-				.retrieve()
-				.body(NiAccessTokenResponse.class)));
+		NiAccessTokenResponse response = this.calls.callIdempotent(OPERATION, () -> this.identityClient.post()
+			.uri(TOKEN_URI)
+			.header(HttpHeaders.AUTHORIZATION, "Basic " + this.properties.apiKey())
+			.contentType(NiMediaTypes.IDENTITY_V1)
+			.retrieve()
+			.body(NiAccessTokenResponse.class));
 		if (response.accessToken() == null || response.accessToken().isBlank()) {
 			throw new GatewayUnavailableException(OPERATION, "no access_token in response", null);
 		}

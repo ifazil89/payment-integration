@@ -272,10 +272,39 @@ class NiGatewayClientTest {
 		assertThat(event).isEqualTo(new GatewayWebhookEvent("evt-1", "PURCHASED", "order-ref-1", null));
 	}
 
+	@Test
+	void openCircuitFailsFastWithoutCallingTheGateway() {
+		NiGatewayClient fragile = client(ni.baseUrl(), new NiProperties.Breaker(2, 2, 50, Duration.ofMinutes(1)));
+		ni.stubFor(post(PAYMENT_PATH).willReturn(aResponse().withStatus(502)));
+
+		assertThatThrownBy(() -> fragile.createPayment(paymentRequest()))
+			.isInstanceOf(GatewayOutcomeUnknownException.class);
+		assertThatThrownBy(() -> fragile.createPayment(paymentRequest()))
+			.isInstanceOf(GatewayUnavailableException.class)
+			.hasMessageContaining("circuit breaker open");
+		ni.verify(1, postRequestedFor(urlEqualTo(PAYMENT_PATH)));
+	}
+
+	@Test
+	void rejectionsDoNotOpenTheCircuit() {
+		NiGatewayClient fragile = client(ni.baseUrl(), new NiProperties.Breaker(2, 2, 50, Duration.ofMinutes(1)));
+		ni.stubFor(post(PAYMENT_PATH).willReturn(aResponse().withStatus(422)));
+
+		for (int i = 0; i < 3; i++) {
+			assertThatThrownBy(() -> fragile.createPayment(paymentRequest()))
+				.isInstanceOf(GatewayRejectedException.class);
+		}
+		ni.verify(3, postRequestedFor(urlEqualTo(PAYMENT_PATH)));
+	}
+
 	private NiGatewayClient client(String baseUrl) {
+		return client(baseUrl, new NiProperties.Breaker(100, 100, 50, Duration.ofMinutes(1)));
+	}
+
+	private NiGatewayClient client(String baseUrl, NiProperties.Breaker breaker) {
 		NiProperties properties = new NiProperties(baseUrl, "test-api-key", "outlet-1", "PURCHASE",
 				Duration.ofSeconds(1), Duration.ofMillis(500), Duration.ofSeconds(60),
-				new NiProperties.Retry(2, Duration.ofMillis(20), 2.0),
+				new NiProperties.Retry(2, Duration.ofMillis(20), 2.0), breaker,
 				new NiProperties.Webhook("X-NI-Webhook-Secret", "webhook-secret"));
 		return new NiGatewayConfiguration().niGatewayClient(RestClient.builder(), properties, this.json,
 				Clock.systemUTC());

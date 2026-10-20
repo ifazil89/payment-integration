@@ -8,6 +8,7 @@ import com.fazil.payments.config.PaymentProperties;
 import com.fazil.payments.domain.exception.PaymentNotFoundException;
 import com.fazil.payments.domain.model.Money;
 import com.fazil.payments.domain.model.Payment;
+import com.fazil.payments.gateway.GatewayWebhookEvent;
 import com.fazil.payments.gateway.PaymentGateway;
 import com.fazil.payments.gateway.exception.WebhookAuthenticationException;
 import com.fazil.payments.service.CreatePaymentCommand;
@@ -21,6 +22,7 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.core.task.TaskRejectedException;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
@@ -33,6 +35,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
+import static org.mockito.BDDMockito.willThrow;
 import static org.mockito.Mockito.never;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -163,6 +166,16 @@ class PaymentControllerTest {
 		this.mockMvc.perform(post("/api/v1/webhooks/ni").contentType(MediaType.APPLICATION_JSON).content("{}"))
 			.andExpect(status().isUnauthorized());
 		then(this.webhookService).should(never()).processAsync(any());
+	}
+
+	@Test
+	void webhookIsAcknowledgedEvenWhenProcessingCapacityIsExhausted() throws Exception {
+		GatewayWebhookEvent event = new GatewayWebhookEvent("evt-1", "PURCHASED", "order-ref-1", ID);
+		given(this.paymentGateway.parseWebhook(any(), eq("{}"))).willReturn(event);
+		willThrow(new TaskRejectedException("full")).given(this.webhookService).processAsync(event);
+
+		this.mockMvc.perform(post("/api/v1/webhooks/ni").contentType(MediaType.APPLICATION_JSON).content("{}"))
+			.andExpect(status().isOk());
 	}
 
 	@TestConfiguration(proxyBeanMethods = false)

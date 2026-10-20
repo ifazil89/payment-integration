@@ -4,6 +4,9 @@ import java.time.Clock;
 
 import com.fazil.payments.gateway.exception.GatewayOutcomeUnknownException;
 import com.fazil.payments.gateway.exception.GatewayUnavailableException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import lombok.extern.slf4j.Slf4j;
 import tools.jackson.databind.json.JsonMapper;
 
 import org.springframework.boot.http.client.ClientHttpRequestFactoryBuilder;
@@ -21,6 +24,7 @@ import org.springframework.web.client.RestClient;
  * converters and HTTP client observations (metrics, tracing) apply to every N-Genius call.
  */
 @Configuration(proxyBeanMethods = false)
+@Slf4j
 class NiGatewayConfiguration {
 
 	@Bean
@@ -29,13 +33,14 @@ class NiGatewayConfiguration {
 		RestClient.Builder niBuilder = restClientBuilder.clone()
 			.baseUrl(properties.baseUrl())
 			.requestFactory(requestFactory(properties));
-		RetryTemplate retryTemplate = retryTemplate(properties.retry());
-		NiAccessTokenProvider tokenProvider = new NiAccessTokenProvider(niBuilder.clone().build(), properties,
-				retryTemplate, clock);
+		NiCallExecutor calls = new NiCallExecutor(circuitBreaker(properties.circuitBreaker()),
+				retryTemplate(properties.retry()));
+		NiAccessTokenProvider tokenProvider = new NiAccessTokenProvider(niBuilder.clone().build(), properties, calls,
+				clock);
 		RestClient apiClient = niBuilder.clone()
 			.requestInterceptor(new NiBearerTokenInterceptor(tokenProvider))
 			.build();
-		return new NiGatewayClient(apiClient, properties, new NiPaymentMapper(jsonMapper), retryTemplate, jsonMapper);
+		return new NiGatewayClient(apiClient, properties, new NiPaymentMapper(jsonMapper), calls, jsonMapper);
 	}
 
 	private static ClientHttpRequestFactory requestFactory(NiProperties properties) {
@@ -54,6 +59,20 @@ class NiGatewayConfiguration {
 			.multiplier(retry.multiplier())
 			.includes(GatewayUnavailableException.class, GatewayOutcomeUnknownException.class)
 			.build());
+	}
+
+	/** Gateway-side failures trip the breaker; 4xx rejections are business answers and count as successes. */
+	private static CircuitBreaker circuitBreaker(NiProperties.Breaker breaker) {
+		CircuitBreaker circuitBreaker = CircuitBreaker.of("ni", CircuitBreakerConfig.custom()
+			.slidingWindowSize(breaker.slidingWindowSize())
+			.minimumNumberOfCalls(breaker.minimumCalls())
+			.failureRateThreshold(breaker.failureRateThreshold())
+			.waitDurationInOpenState(breaker.waitInOpenState())
+			.recordExceptions(GatewayUnavailableException.class, GatewayOutcomeUnknownException.class)
+			.build());
+		circuitBreaker.getEventPublisher()
+			.onStateTransition(event -> log.warn("N-Genius circuit breaker {}", event.getStateTransition()));
+		return circuitBreaker;
 	}
 
 }

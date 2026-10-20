@@ -3,10 +3,12 @@ package com.fazil.payments.gateway.ni;
 import java.time.Duration;
 
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.DecimalMax;
 import jakarta.validation.constraints.DecimalMin;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import jakarta.validation.constraints.Pattern;
+import jakarta.validation.constraints.Positive;
 import jakarta.validation.constraints.PositiveOrZero;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -21,6 +23,7 @@ import org.springframework.validation.annotation.Validated;
  * which this integration does not implement
  * @param tokenRefreshMargin how long before expiry a cached access token is replaced
  * @param retry backoff for the idempotent calls (access token, order lookup); the payment POST is never retried
+ * @param circuitBreaker shared by every N-Genius call; while open, calls fail fast without being sent
  */
 @ConfigurationProperties("ni")
 @Validated
@@ -28,11 +31,22 @@ public record NiProperties(@NotBlank String baseUrl, @NotBlank String apiKey, @N
 		@DefaultValue("PURCHASE") @Pattern(regexp = "PURCHASE|SALE") String orderAction,
 		@DefaultValue("5s") @NotNull Duration connectTimeout, @DefaultValue("30s") @NotNull Duration readTimeout,
 		@DefaultValue("60s") @NotNull Duration tokenRefreshMargin, @Valid @NotNull @DefaultValue Retry retry,
-		@Valid @NotNull Webhook webhook) {
+		@Valid @NotNull @DefaultValue Breaker circuitBreaker, @Valid @NotNull Webhook webhook) {
 
 	public record Retry(@DefaultValue("2") @PositiveOrZero int maxRetries,
 			@DefaultValue("300ms") @NotNull Duration initialDelay,
 			@DefaultValue("2.0") @DecimalMin("1.0") double multiplier) {
+	}
+
+	/**
+	 * @param failureRateThreshold percentage of failed calls in the window that opens the breaker
+	 * @param minimumCalls calls needed in the window before the failure rate is evaluated
+	 * @param waitInOpenState how long calls are refused before a few trial calls are let through
+	 */
+	public record Breaker(@DefaultValue("20") @Positive int slidingWindowSize,
+			@DefaultValue("10") @Positive int minimumCalls,
+			@DefaultValue("50") @DecimalMin("1") @DecimalMax("100") float failureRateThreshold,
+			@DefaultValue("30s") @NotNull Duration waitInOpenState) {
 	}
 
 	public record Webhook(@DefaultValue("X-NI-Webhook-Secret") @NotBlank String headerName,
@@ -50,7 +64,7 @@ public record NiProperties(@NotBlank String baseUrl, @NotBlank String apiKey, @N
 		return "NiProperties[baseUrl=" + this.baseUrl + ", apiKey=***, outletRef=" + this.outletRef
 				+ ", orderAction=" + this.orderAction + ", connectTimeout=" + this.connectTimeout + ", readTimeout="
 				+ this.readTimeout + ", tokenRefreshMargin=" + this.tokenRefreshMargin + ", retry=" + this.retry
-				+ ", webhook=" + this.webhook + "]";
+				+ ", circuitBreaker=" + this.circuitBreaker + ", webhook=" + this.webhook + "]";
 	}
 
 }

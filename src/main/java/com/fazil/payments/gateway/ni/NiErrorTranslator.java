@@ -76,7 +76,7 @@ final class NiErrorTranslator {
 			String code = errors.path(0).path("errorCode").asString(null);
 			return (code != null && SAFE_CODE.matcher(code).matches()) ? code : null;
 		}
-		catch (JacksonException | IllegalArgumentException parseFailure) {
+		catch (JacksonException | IllegalArgumentException _) {
 			return null;
 		}
 	}

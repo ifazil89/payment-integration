@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-Freshly generated Spring Initializr skeleton (Spring Boot 4.1.1, Java 21, Maven). The only production class is `PaymentIntegrationApplication`; there is no domain code, and `application.yaml` only sets the app name. There is intentionally no relational database (JPA/Flyway were removed) for now.
+Freshly generated Spring Initializr skeleton (Spring Boot 4.1.1, Java 25, Maven). The only production class is `PaymentIntegrationApplication`; there is no domain code, and `application.yaml` only sets the app name. There is intentionally no relational database (JPA/Flyway were removed) for now.
 
 ## Commands
 
@@ -28,19 +28,9 @@ Use the Maven wrapper (`./mvnw`); Docker must be running for tests and for the l
 
 ## NI N-Genius (one-stage Direct API)
 - Spec: @doc/ngenius/ngenius-one-stage-spec.md (follow it exactly; follow _links hrefs, don't hand-build URLs)
-- All NI calls live in NiGatewayClient behind the PaymentGateway interface. Bearer token added by NiBearerTokenInterceptor (cached in NiAccessTokenProvider, refreshed before 300s; one retry on 401). HTTP errors are translated by NiErrorTranslator; only idempotent calls (token, GET order) go through the RetryTemplate.
+- All NI calls live in NiGatewayClient behind the PaymentGateway interface. Bearer token added by NiBearerTokenInterceptor (cached in NiAccessTokenProvider, refreshed before 300s; one retry on 401). Every call goes through NiCallExecutor: one Resilience4j circuit breaker (`ni.circuit-breaker.*`; 4xx don't trip it) plus NiErrorTranslator. Only idempotent calls (token, GET order) use `callIdempotent` (RetryTemplate).
 - PAN/CVV/expiry: never logged, never persisted, never in exceptions or metrics. Mask in all DTO toString().
 - Treat payment `state` as an open enum; unknown values are logged, not fatal.
 - Never blind-retry the payment POST. On timeout, mark payment UNKNOWN and reconcile via GET order.
 - Webhook: verify secret header, dedupe by eventId, return 200 fast, process async.
-- 
-## Structure
-- Base package: com.fazil.payments. Dependency direction: api -> service -> gateway, repository -> domain. `domain` depends on nothing in the app.
-- `api/` controllers; `api/dto/{request,response}` REST contract; `api/mapper` DTO <-> domain mapping (no static `from`/`to` methods on DTOs); `api/error/GlobalExceptionHandler` (extends ResponseEntityExceptionHandler, RFC 9457); `api/validation` custom constraints (`@PaymentId`).
-- `service/` use cases (PaymentService, WebhookService) plus their command/result records.
-- `scheduler/` `@Scheduled` jobs (reconciliation; disable with `payments.reconciliation.enabled=false`).
-- `domain/model` entities and value objects (Payment, PaymentStatus, Money, CardDetails, GatewayLinks, GatewayPaymentResult...); `domain/exception` business exceptions mapped to 404/409.
-- `gateway/` the PaymentGateway port and its request/event types; `gateway/exception` the gateway failure hierarchy. All NI code stays in `gateway/ni` (package-private except `NiProperties`); NI wire DTOs in `gateway/ni/dto`. Other layers use only the PaymentGateway interface.
-- `repository/` Spring Data Elasticsearch repositories. Payment writes go through the `PaymentRepositoryCustom` fragment (`insertIfAbsent`, optimistic-locking `update`), never plain `save`.
-- `config/` Spring configuration and `@ConfigurationProperties` (picked up by `@ConfigurationPropertiesScan`); `common/logging` correlation id filter and MDC propagation.
-- Tests mirror main packages; WireMock stubs in src/test/resources. Controller tests are `@WebMvcTest` slices; NI tests build the client through `NiGatewayConfiguration`.
+-

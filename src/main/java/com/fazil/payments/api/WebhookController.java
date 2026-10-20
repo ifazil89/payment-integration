@@ -7,6 +7,7 @@ import io.swagger.v3.oas.annotations.Hidden;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
+import org.springframework.core.task.TaskRejectedException;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -35,7 +36,15 @@ public class WebhookController {
 	public ResponseEntity<Void> receiveWebhook(@RequestHeader HttpHeaders headers, @RequestBody String body) {
 		GatewayWebhookEvent event = this.paymentGateway.parseWebhook(headers, body);
 		log.info("Accepted webhook event {} ({})", event.eventId(), event.eventName());
-		this.webhookService.processAsync(event);
+		try {
+			this.webhookService.processAsync(event);
+		}
+		catch (TaskRejectedException ex) {
+			// Still acknowledge: N-Genius never retries, so waiting for capacity past its 15 s timeout would lose
+			// the event just the same. The reconciliation job still resolves pending payments.
+			log.error("Dropped webhook event {} ({}): processing capacity exhausted", event.eventId(),
+					event.eventName());
+		}
 		return ResponseEntity.ok().build();
 	}
 

@@ -11,7 +11,9 @@ spring:
       thread-name-prefix: payments-async-
       simple:
         # Bounds concurrent webhook processing so a burst cannot exhaust Elasticsearch or N-Genius limits.
+        # Reject rather than block when full, so the webhook endpoint still acknowledges within 15 s.
         concurrency-limit: 50
+        reject-tasks-when-limit-reached: true
     scheduling:
       thread-name-prefix: payments-scheduler-
 
@@ -32,6 +34,11 @@ ni:
     max-retries: 2
     initial-delay: 300ms
     multiplier: 2.0
+  circuit-breaker:
+    sliding-window-size: 20
+    minimum-calls: 10
+    failure-rate-threshold: 50
+    wait-in-open-state: 30s
   webhook:
     header-name: ${NI_WEBHOOK_HEADER_NAME:X-NI-Webhook-Secret}
     header-value: ${NI_WEBHOOK_SECRET}
@@ -59,3 +66,14 @@ management:
 logging:
   pattern:
     correlation: "[%X{correlationId:-}] "
+
+---
+# Production: JSON (ECS) logs; the MDC correlation id is included as a field.
+spring:
+  config:
+    activate:
+      on-profile: prod
+logging:
+  structured:
+    format:
+      console: ecs
