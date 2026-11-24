@@ -1,0 +1,126 @@
+1. ApplePayProperties.java: replace the Key record
+
+java
+    /**
+     * One Payment Processing Certificate + its private key. Set EITHER the .p12 OR certificate + private-key.
+     *
+     * @param keystore         .p12 location: "file:/secrets/apple-pay.p12" or "classpath:apple/apple-pay.p12"
+     * @param keystorePassword password of the .p12 (also used for the key inside it)
+     * @param alias            entry in the .p12; empty = the first entry that has a private key
+     * @param certificate      base64 DER (or PEM) of the Payment Processing Certificate from Apple
+     * @param privateKey       base64 (or PEM) PKCS#8 EC P-256 private key that belongs to it
+     */
+    public record Key(String keystore, String keystorePassword, String alias,
+                      String certificate, String privateKey) {
+
+        public boolean isKeystore() {
+            return keystore != null && !keystore.isBlank();
+        }
+
+        @Override
+        public String toString() {
+            return "Key[keystore=" + keystore + ", alias=" + alias + ", keystorePassword=***, privateKey=***]";
+        }
+    }
+
+2. WalletConfig.java: replace the for loop in applePayDecryptor(...)
+
+java
+        for (ApplePayProperties.Key key : keys) {
+            LoadedKey loaded = key.isKeystore() ? fromKeystore(key, resourceLoader) : fromBase64(key);
+            String publicKeyHash = ApplePayCrypto.publicKeyHash(loaded.certificate().getPublicKey());
+            keysByPublicKeyHash.put(publicKeyHash, loaded.privateKey());
+            log.info("Apple Pay key loaded from {}: publicKeyHash {}, subject {}, valid until {}",
+                    key.isKeystore() ? key.keystore() : "certificate/private-key properties", publicKeyHash,
+                    loaded.certificate().getSubjectX500Principal().getName(), loaded.certificate().getNotAfter());
+        }
+
+Add these to the key-helpers section of WalletConfig:
+
+java
+    private record LoadedKey(X509Certificate certificate, PrivateKey privateKey) {
+    }
+
+    /** Separate certificate + private key (base64 / PEM), as before. */
+    private static LoadedKey fromBase64(ApplePayProperties.Key key) throws GeneralSecurityException {
+        require(key.certificate(), "wallet.apple-pay.keys[].certificate (APPLE_PAY_CERTIFICATE)");
+        require(key.privateKey(), "wallet.apple-pay.keys[].private-key (APPLE_PAY_PRIVATE_KEY)");
+        return new LoadedKey(certificate(decode(key.certificate())), ecPrivateKey(decode(key.privateKey())));
+    }
+
+    /** Certificate + private key from one .p12 (PKCS#12) file. */
+    private static LoadedKey fromKeystore(ApplePayProperties.Key key, ResourceLoader resourceLoader) throws Exception {
+        Resource resource = resourceLoader.getResource(key.keystore());
+        if (!resource.exists()) {
+            throw new IllegalStateException("Apple Pay keystore not found: " + key.keystore()
+                    + " (wallet.apple-pay.keys[].keystore / APPLE_PAY_KEYSTORE)");
+        }
+        char[] password = key.keystorePassword() == null ? new char[0] : key.keystorePassword().toCharArray();
+        try {
+            KeyStore keyStore = KeyStore.getInstance("PKCS12");
+            try (InputStream in = resource.getInputStream()) {
+                keyStore.load(in, password);   // wrong password -> IOException here
+            }
+            String alias = key.alias() != null && !key.alias().isBlank() ? key.alias() : firstKeyAlias(keyStore);
+            if (!keyStore.isKeyEntry(alias)) {
+                throw new IllegalStateException("Apple Pay keystore " + key.keystore()
+                        + " has no private key under alias '" + alias + "'");
+            }
+            PrivateKey privateKey = (PrivateKey) keyStore.getKey(alias, password);
+            X509Certificate certificate = (X509Certificate) keyStore.getCertificate(alias);
+            if (!"EC".equals(privateKey.getAlgorithm())) {
+                throw new IllegalStateException("Apple Pay keystore " + key.keystore() + ": the key is "
+                        + privateKey.getAlgorithm() + ", Apple Pay EC_v1 needs an EC P-256 key "
+                        + "(the .p12 must hold the Payment Processing Certificate, not the Merchant Identity one)");
+            }
+            return new LoadedKey(certificate, privateKey);
+        } catch (IOException ex) {
+            throw new IllegalStateException("Cannot open Apple Pay keystore " + key.keystore()
+                    + ": wrong password or not a PKCS#12 file", ex);
+        } finally {
+            Arrays.fill(password, '\0');
+        }
+    }
+
+    private static String firstKeyAlias(KeyStore keyStore) throws KeyStoreException {
+        for (String alias : Collections.list(keyStore.aliases())) {
+            if (keyStore.isKeyEntry(alias)) {
+                return alias;
+            }
+        }
+        throw new IllegalStateException("Apple Pay keystore contains no private key");
+    }
+
+Add these imports:
+
+java
+import java.io.IOException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.util.Arrays;
+import java.util.Collections;
+
+3. application.yml: replace the keys: block under wallet.apple-pay
+
+yaml
+    # One entry per Payment Processing Certificate; two during a rotation.
+    # Either a .p12 file ...
+    keys:
+      - keystore: ${APPLE_PAY_KEYSTORE:}                    # file:/secrets/apple-pay.p12 or classpath:apple/apple-pay.p12
+        keystore-password: ${APPLE_PAY_KEYSTORE_PASSWORD:}
+        alias: ${APPLE_PAY_KEYSTORE_ALIAS:}                 # empty = first entry with a private key
+    # ... or a separate certificate + private key:
+    #  - certificate: ${APPLE_PAY_CERTIFICATE:}            # base64 of the .cer (DER) from Apple
+    #    private-key: ${APPLE_PAY_PRIVATE_KEY:}            # base64 PKCS#8 EC P-256 private key
+
+In local dev, put the file under src/main/resources/apple/ (and add it to .gitignore) and set APPLE_PAY_KEYSTORE=classpath:apple/apple-pay.p12. In QA and production, mount the file from a secret and use file:/.... Keep the password in an environment variable, never in the yml.
+
+Things to check:
+
+Right certificate: Apple gives you two. The .p12 must hold the Payment Processing Certificate, which is an elliptic-curve (EC) key. The other one, the Merchant Identity Certificate, is an RSA key used only for Apple Pay on the web. If you load the wrong one, the app stops at startup and says so.
+Is it working: at startup the log prints the certificate’s subject and expiry date. The subject should contain your merchant id.
+If Java can’t open the file: a .p12 exported from an older macOS Keychain sometimes uses old encryption Java can’t read. Re-export it with OpenSSL:
+bash
+openssl pkcs12 -in old.p12 -nodes -out tmp.pem -legacy
+openssl pkcs12 -export -in tmp.pem -out apple-pay.p12 && rm tmp.pem
+Tests: ApplePayProperties.Key now has 5 fields instead of 2. Any test that builds new ApplePayProperties.Key(cert, key) needs to change to new ApplePayProperties.Key(null, null, null, cert, key).
