@@ -163,3 +163,211 @@ Rotating certificates: put the new .p12 in the same folder and add a second keys
 Startup: if the folder or a file is missing or can’t be read, or a plain file name is given with no folder set, the app stops at startup and the message names the full path. When it works, the log shows Apple Pay certificate folder: /opt/... and the line for each loaded key.
 
 Tests: ApplePayProperties now has one more constructor argument (certificateDir, the second one). Any test that builds it directly needs null added there.
+
+
+###########
+
+1. keys/WalletKeys.java: add two readers (plain JDK)
+
+java
+    /** Apple's "merchant identifier" certificate extension: SHA-256 of the merchant id. */
+    public static final String APPLE_MERCHANT_ID_OID = "1.2.840.113635.100.6.32";
+
+    /**
+     * SHA-256 of the merchant id, read from the Apple Pay certificate (32 bytes), or null if the certificate
+     * has no such extension (then it is not an Apple Pay certificate).
+     * Apple stores it as a hex string (UTF8String / IA5String); a raw 32-byte OCTET STRING is accepted too.
+     */
+    public static byte[] appleMerchantIdentifierHash(X509Certificate certificate) {
+        byte[] extension = certificate.getExtensionValue(APPLE_MERCHANT_ID_OID);
+        if (extension == null) {
+            return null;
+        }
+        byte[] inner = derValue(extension);          // the extension value is wrapped in an OCTET STRING
+        int tag = inner[0] & 0xff;
+        byte[] value = derValue(inner);
+        if (tag == 0x04 && value.length == 32) {
+            return value;
+        }
+        byte[] hash = HexFormat.of().parseHex(new String(value, StandardCharsets.US_ASCII).trim());
+        if (hash.length != 32) {
+            throw new IllegalStateException("Apple merchant identifier extension is not a SHA-256 hash");
+        }
+        return hash;
+    }
+
+    /** The plain merchant id (subject UID, e.g. merchant.com.company.shop), for logs; null if absent. */
+    public static String appleMerchantIdentifier(X509Certificate certificate) {
+        String dn = certificate.getSubjectX500Principal().getName(X500Principal.RFC2253);
+        for (String part : dn.split("(?<!\\\\),")) {
+            if (part.startsWith("UID=")) {
+                return part.substring(4);
+            }
+        }
+        return null;
+    }
+
+    /** Value bytes of one DER element (tag, short or long-form length, value). */
+    private static byte[] derValue(byte[] der) {
+        int i = 1;
+        int length = der[i++] & 0xff;
+        if (length > 0x7f) {
+            int bytes = length & 0x7f;
+            length = 0;
+            for (int k = 0; k < bytes; k++) {
+                length = (length << 8) | (der[i++] & 0xff);
+            }
+        }
+        return Arrays.copyOfRange(der, i, i + length);
+    }
+
+Add these imports:
+
+java
+import javax.security.auth.x500.X500Principal;
+import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;
+
+2. applepay/ApplePayDecryptor.java: each key carries its own merchant hash. During a certificate rotation, each certificate then uses its own.
+
+java
+    /** Our Payment Processing private key + the merchant id hash from its certificate. */
+    public record MerchantKey(PrivateKey privateKey, byte[] merchantIdentifierHash) {
+
+        public MerchantKey {
+            merchantIdentifierHash = merchantIdentifierHash.clone();
+        }
+
+        @Override
+        public String toString() {
+            return "MerchantKey[privateKey=***]";
+        }
+    }
+
+    private final ApplePaySignatureVerifier signatureVerifier;
+    /** publicKeyHash (as in the token header) -> our key. Two during a rotation. */
+    private final Map<String, MerchantKey> keysByPublicKeyHash;
+    private final ObjectMapper objectMapper;
+
+    public ApplePayDecryptor(ApplePaySignatureVerifier signatureVerifier, Map<String, MerchantKey> keysByPublicKeyHash,
+                             ObjectMapper objectMapper) {
+        this.signatureVerifier = signatureVerifier;
+        this.keysByPublicKeyHash = Map.copyOf(keysByPublicKeyHash);
+        this.objectMapper = objectMapper;
+    }
+
+In decrypt(ApplePayToken), change the key lookup and the decryption call:
+
+java
+        MerchantKey key = keysByPublicKeyHash.get(header.publicKeyHash());
+        if (key == null) {
+            throw WalletDecryptionException.invalid("token is encrypted for another Payment Processing Certificate "
+                    + "(publicKeyHash " + header.publicKeyHash() + ")");
+        }
+
+        byte[] plaintext;
+        try {
+            plaintext = ApplePayCrypto.decrypt(Base64.getDecoder().decode(token.data()),
+                    Base64.getDecoder().decode(header.ephemeralPublicKey()), key.privateKey(), key.merchantIdentifierHash());
+
+3. spring/WalletAutoConfiguration.java in applePayDecryptor(...)
+
+Remove this line:
+
+java
+        require(properties.merchantIdentifier(), "wallet.apple-pay.merchant-identifier (APPLE_PAY_MERCHANT_ID)");
+
+Replace the loop and the return:
+
+java
+        Map<String, ApplePayDecryptor.MerchantKey> keysByPublicKeyHash = new LinkedHashMap<>();
+        for (ApplePayProperties.Key key : properties.keys()) {
+            if (key.isEmpty()) {
+                continue;
+            }
+            CertificateAndKey loaded = key.isKeystore()
+                    ? fromKeystore(key, resource(key.keystore(), certificateDir, resourceLoader))
+                    : fromBase64(key);
+            byte[] merchantHash = merchantIdentifierHash(loaded.certificate(), properties.merchantIdentifier());
+            String publicKeyHash = ApplePayCrypto.publicKeyHash(loaded.certificate().getPublicKey());
+            keysByPublicKeyHash.put(publicKeyHash, new ApplePayDecryptor.MerchantKey(loaded.privateKey(), merchantHash));
+            log.info("Apple Pay key loaded from {}: merchant {}, publicKeyHash {}, valid until {}",
+                    key.isKeystore() ? key.keystore() : "certificate/private-key properties",
+                    WalletKeys.appleMerchantIdentifier(loaded.certificate()), publicKeyHash,
+                    loaded.certificate().getNotAfter());
+        }
+        // ... empty-keys check + root CA loading unchanged ...
+        return new ApplePayDecryptor(verifier, keysByPublicKeyHash, mapper(objectMapper));
+
+Add this helper:
+
+java
+    /**
+     * The merchant id hash comes from the certificate. wallet.apple-pay.merchant-identifier is optional:
+     * if set, it must match the certificate (catches a .p12 from the wrong merchant at startup).
+     */
+    private static byte[] merchantIdentifierHash(X509Certificate certificate, String configuredMerchantId) {
+        byte[] fromCertificate = WalletKeys.appleMerchantIdentifierHash(certificate);
+        if (fromCertificate == null) {
+            throw new IllegalStateException("Certificate " + certificate.getSubjectX500Principal().getName()
+                    + " has no Apple merchant identifier (OID " + WalletKeys.APPLE_MERCHANT_ID_OID
+                    + "): is it the Apple Pay Payment Processing Certificate?");
+        }
+        if (configuredMerchantId != null && !configuredMerchantId.isBlank()
+                && !MessageDigest.isEqual(fromCertificate, ApplePayCrypto.merchantIdentifierHash(configuredMerchantId))) {
+            throw new IllegalStateException("wallet.apple-pay.merchant-identifier '" + configuredMerchantId
+                    + "' does not match the certificate's merchant ("
+                    + WalletKeys.appleMerchantIdentifier(certificate) + ")");
+        }
+        return fromCertificate;
+    }
+
+Add import java.security.MessageDigest;.
+
+4. spring/ApplePayProperties.java: change only the doc line
+
+java
+ * @param merchantIdentifier  optional: read from the certificate. If set, it must match the certificate.
+
+5. application.yml
+
+yaml
+    merchant-identifier: ${APPLE_PAY_MERCHANT_ID:}       # optional: taken from the .p12; if set, must match it
+
+6. ApplePayDecryptorTest: construct the decryptor with the new key type
+
+java
+        decryptor = new ApplePayDecryptor(verifier,
+                Map.of(ApplePayCrypto.publicKeyHash(merchant.getPublic()),
+                        new ApplePayDecryptor.MerchantKey(merchant.getPrivate(),
+                                ApplePayCrypto.merchantIdentifierHash(MERCHANT_ID))),
+                JsonMapper.builder().build());
+
+The test builds its key pair in code, so it passes the hash directly. Reading the certificate is covered by the next test.
+
+7. WalletKeysTest: one new test. It reuses the existing keyPair(...) helper and needs the BouncyCastle imports DEROctetString, DERUTF8String, ASN1ObjectIdentifier and java.security.MessageDigest, java.util.HexFormat.
+
+java
+    @Test
+    void readsTheMerchantIdentifierFromTheCertificate() throws Exception {
+        String merchantId = "merchant.com.company.shop";
+        byte[] hash = MessageDigest.getInstance("SHA-256").digest(merchantId.getBytes(StandardCharsets.UTF_8));
+        KeyPair keyPair = keyPair("EC", new ECGenParameterSpec("secp256r1"));
+        X500Name name = new X500Name("UID=" + merchantId + ",CN=Apple Pay Payment Processing:" + merchantId);
+        X509Certificate certificate = new JcaX509CertificateConverter().getCertificate(
+                new JcaX509v3CertificateBuilder(name, BigInteger.ONE, new Date(), new Date(System.currentTimeMillis() + 86_400_000L),
+                        name, keyPair.getPublic())
+                        .addExtension(new ASN1ObjectIdentifier(WalletKeys.APPLE_MERCHANT_ID_OID), false,
+                                new DERUTF8String(HexFormat.of().withUpperCase().formatHex(hash)))
+                        .build(new JcaContentSignerBuilder("SHA256withECDSA").build(keyPair.getPrivate())));
+
+        assertThat(WalletKeys.appleMerchantIdentifierHash(certificate)).isEqualTo(hash);
+        assertThat(WalletKeys.appleMerchantIdentifier(certificate)).isEqualTo(merchantId);
+    }
+
+What you’ll see at startup:
+
+Apple Pay key loaded from apple-pay.p12: merchant merchant.com.company.shop, publicKeyHash ..., valid until ...
+If that line shows your merchant id, the .p12 is the right one. You can then leave APPLE_PAY_MERCHANT_ID unset.
+If you do set it, it acts as a check: startup stops when the .p12 belongs to a different merchant.
+If the .p12 holds the Merchant Identity Certificate (the one for Apple Pay on the web), startup stops. That certificate isn’t the one used to decrypt tokens. (In my test I didn’t check whether it has this extension; if it does, the RSA-key check in WalletKeys catches it firs
