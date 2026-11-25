@@ -1,0 +1,313 @@
+A Checkout.com payment response includes source.id (src_…), a stored reference to the card. You save it and pay with it later using "source": {"type": "id", "id": "src_…"}. That covers both a shopper paying with a saved card and a merchant-initiated charge (recurring or unscheduled) that links back to the first payment. I haven’t compiled or run these changes.
+
+1. Save source.id
+
+cko/dto/CkoPaymentResponse.java: add id to Source:
+
+java
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public record Source(
+            @JsonProperty("id") String id,                      // src_...: reusable for future payments
+            @JsonProperty("type") String type,
+            @JsonProperty("scheme") String scheme,
+            @JsonProperty("last4") String last4,
+            @JsonProperty("payment_account_reference") String paymentAccountReference) {
+    }
+
+payment/entity/ProviderResult.java: add a component at the end:
+
+java
+        String cardLast4,
+        String sourceId) {
+
+payment/mapper/PaymentCkoMapper.java, on toResult:
+
+java
+    @Mapping(target = "sourceId", source = "source.id")
+    ProviderResult toResult(CkoPaymentResponse response);
+
+payment/entity/Payment.java:
+
+java
+    /** Checkout.com stored card (src_...), returned to the client to pay again later. Not card data. */
+    @Column(name = "cko_source_id")
+    private String ckoSourceId;
+
+In applyProviderResult(...):
+
+java
+        this.ckoSourceId = keep(result.sourceId(), ckoSourceId);
+
+This runs for both POST and GET (the refresh path), so the id is saved whichever call returns it first.
+
+2. Database: V3__cko_source_id.sql in both migration folders
+
+H2:
+
+sql
+ALTER TABLE payment ADD COLUMN cko_source_id VARCHAR(64);
+CREATE INDEX ix_payment_cko_source ON payment (client_id, cko_source_id);
+
+Oracle:
+
+sql
+ALTER TABLE payment ADD (cko_source_id VARCHAR2(64));
+CREATE INDEX ix_payment_cko_source ON payment (client_id, cko_source_id);
+
+3. Return it to the client
+
+payment/dto/PaymentResponse.java: add a field after providerPaymentId:
+
+java
+        String providerPaymentId,
+        String sourceId,
+
+payment/mapper/PaymentMapper.java, on toResponse:
+
+java
+    @Mapping(target = "sourceId", source = "ckoSourceId")
+
+payment/openapi/schema/PaymentResponseSchema.java: add it in the same position, so DocSchemaTest still passes:
+
+java
+        @Schema(example = "src_wmlfc3zyhqzehihu7giusaaawu", description = """
+                Checkout.com stored card. Send it as paymentMethod.storedCard.sourceId to pay again with the same card \
+                (only for the same client). Present once Checkout.com returned it.""")
+        String sourceId,
+
+4. New payment method STORED_CARD
+
+payment/dto/PaymentMethodType.java:
+
+java
+    STORED_CARD,      // paymentMethod.storedCard: a Checkout.com source id (src_...) from an earlier payment
+
+New file payment/dto/StoredCardDetails.java:
+
+java
+package com.company.checkout.payment.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+
+/**
+ * Pay with a card Checkout.com stored on an earlier payment (PaymentResponse.sourceId).
+ *
+ * Shopper present (merchantInitiated false/absent): cvv optional, 3DS like a plain card.
+ * Merchant-initiated (merchantInitiated true): no cvv, no 3DS; paymentType and previousPaymentId required.
+ *
+ * @param previousPaymentId the Checkout.com id (pay_...) of the first payment with this card (links the MIT
+ *                          to the shopper-authenticated one, as the card schemes require)
+ */
+public record StoredCardDetails(
+        @NotBlank @Pattern(regexp = "^src_[a-z0-9]{26}$", message = "must be a Checkout.com source id (src_...)")
+        String sourceId,
+        @Pattern(regexp = "\\d{3,4}", message = "must be 3 or 4 digits") String cvv,
+        Boolean merchantInitiated,
+        MitPaymentType paymentType,
+        @Pattern(regexp = "^pay_[a-z0-9]{26}$", message = "must be a Checkout.com payment id (pay_...)")
+        String previousPaymentId) {
+
+    /** Checkout.com payment_type for merchant-initiated payments. */
+    public enum MitPaymentType {
+        RECURRING("Recurring"), UNSCHEDULED("Unscheduled"), INSTALLMENT("Installment");
+
+        private final String cko;
+
+        MitPaymentType(String cko) {
+            this.cko = cko;
+        }
+
+        public String cko() {
+            return cko;
+        }
+    }
+
+    public boolean isMerchantInitiated() {
+        return Boolean.TRUE.equals(merchantInitiated);
+    }
+
+    @Override
+    public String toString() {
+        return "StoredCardDetails[sourceId=****" + (sourceId == null ? null : sourceId.substring(Math.max(0, sourceId.length() - 4)))
+                + ", cvv=" + (cvv == null ? null : "***") + ", merchantInitiated=" + merchantInitiated
+                + ", paymentType=" + paymentType + ", previousPaymentId=" + previousPaymentId + "]";
+    }
+}
+
+Check the exact src_ and pay_ formats against your sandbox responses. If they differ, relax the two patterns to ^src_\w+$ and ^pay_\w+$.
+
+payment/dto/PaymentMethod.java: add the field after networkToken:
+
+java
+        @Valid NetworkTokenDetails networkToken,
+        @Valid StoredCardDetails storedCard,
+
+Update its toString to include storedCard as well.
+
+5. Checkout.com request
+
+cko/dto/CkoSource.java: add id as the first component, and a new factory:
+
+java
+public record CkoSource(
+        @JsonProperty("type") String type,
+        @JsonProperty("id") String id,
+        @JsonProperty("token") String token,
+        ...                                            // rest unchanged
+java
+    /** A stored card: {"type":"id","id":"src_...","cvv":".."} (cvv only when the shopper is present). */
+    public static CkoSource storedCard(String sourceId, String cvv) {
+        return new CkoSource("id", sourceId, null, null, null, null, null, cvv, null, null, null, null);
+    }
+
+In the two existing factories, insert null as the second argument, after "network_token" and after "card".
+
+cko/dto/CkoPaymentRequest.java: add two fields after paymentType:
+
+java
+        @JsonProperty("payment_type") String paymentType,
+        @JsonProperty("merchant_initiated") Boolean merchantInitiated,
+        @JsonProperty("previous_payment_id") String previousPaymentId,
+
+6. payment/service/ResolvedPaymentMethod.java
+
+Add the new components at the end, plus a constructor with the old argument list. Existing calls and tests then don’t change:
+
+java
+        String walletCurrencyNumeric,
+        String sourceId,                 // STORED_CARD: src_...
+        boolean merchantInitiated,
+        String ckoPaymentType,           // Regular / Recurring / Unscheduled / Installment
+        String previousPaymentId) {
+
+    /** All payment methods except STORED_CARD. */
+    public ResolvedPaymentMethod(PaymentMethodType type, AuthMethod authMethod, String number, int expiryMonth,
+                                 int expiryYear, String cvv, String cryptogram, String eci, String tokenType,
+                                 String cardholderName, boolean threeDs, String walletTransactionId,
+                                 Long walletAmountMinor, String walletCurrencyNumeric) {
+        this(type, authMethod, number, expiryMonth, expiryYear, cvv, cryptogram, eci, tokenType, cardholderName,
+                threeDs, walletTransactionId, walletAmountMinor, walletCurrencyNumeric, null, false, "Regular", null);
+    }
+
+    public boolean isStoredCard() {
+        return sourceId != null;
+    }
+
+In last4(), return null when number is null. A stored card has no number here; the last 4 digits come from Checkout.com’s answer.
+
+7. payment/service/PaymentMethodResolver.java
+
+In validate:
+
+java
+        expect(errors, "paymentMethod.storedCard", method.storedCard() != null,
+                type == PaymentMethodType.STORED_CARD, type);
+        if (type == PaymentMethodType.STORED_CARD && method.storedCard() != null && method.storedCard().isMerchantInitiated()) {
+            StoredCardDetails s = method.storedCard();
+            if (s.paymentType() == null) {
+                errors.add(new FieldViolation("paymentMethod.storedCard.paymentType", "is required when merchantInitiated"));
+            }
+            if (s.previousPaymentId() == null) {
+                errors.add(new FieldViolation("paymentMethod.storedCard.previousPaymentId",
+                        "is required when merchantInitiated"));
+            }
+            if (s.cvv() != null) {
+                errors.add(new FieldViolation("paymentMethod.storedCard.cvv", "must not be sent when merchantInitiated"));
+            }
+        }
+
+In resolve:
+
+java
+            case STORED_CARD -> fromStoredCard(method.storedCard());
+
+Add this method:
+
+java
+    /** Shopper present: 3DS like a plain card. Merchant-initiated: no 3DS (the shopper is not there to do it). */
+    private ResolvedPaymentMethod fromStoredCard(StoredCardDetails stored) {
+        boolean mit = stored.isMerchantInitiated();
+        return new ResolvedPaymentMethod(PaymentMethodType.STORED_CARD, AuthMethod.PAN_ONLY, null, 0, 0,
+                stored.cvv(), null, null, null, null, !mit && ckoProperties.threeDsForCards(), null, null, null,
+                stored.sourceId(), mit, mit ? stored.paymentType().cko() : "Regular", stored.previousPaymentId());
+    }
+
+Add import com.company.checkout.payment.dto.StoredCardDetails;.
+
+8. payment/mapper/PaymentCkoMapper.java, in toPaymentRequest
+
+java
+        CkoSource source;
+        if (method.isStoredCard()) {
+            source = CkoSource.storedCard(method.sourceId(), method.cvv());
+        } else if (method.isNetworkToken()) {
+            source = CkoSource.networkToken(...);           // unchanged
+        } else {
+            source = CkoSource.card(...);                   // unchanged
+        }
+        boolean threeDs = method.threeDs();
+        return new CkoPaymentRequest(
+                source,
+                amountMinor,
+                request.amount().currency(),
+                request.merchantOrderId(),
+                properties.capture(),
+                properties.processingChannelId(),
+                method.ckoPaymentType(),
+                method.merchantInitiated() ? Boolean.TRUE : null,
+                method.previousPaymentId(),
+                toCustomer(request.billingInfo()),
+                ... // rest unchanged
+
+9. payment/service/PaymentService.java: a client may only use its own stored cards
+
+A src_ id is valid for your whole Checkout.com account, so without this check one API client could charge another client’s shopper.
+
+PaymentRepository:
+
+java
+    boolean existsByClientIdAndCkoSourceId(String clientId, String ckoSourceId);
+
+In createPayment, right after methodResolver.validate(...):
+
+java
+        if (request.paymentMethod().type() == PaymentMethodType.STORED_CARD
+                && !repository.existsByClientIdAndCkoSourceId(clientId, request.paymentMethod().storedCard().sourceId())) {
+            throw ApiException.unprocessable("STORED_CARD_NOT_FOUND", "Unknown stored card for this client");
+        }
+
+In secretPart(...):
+
+java
+            case STORED_CARD -> m.storedCard().sourceId() + "|" + m.storedCard().previousPaymentId();
+
+10. API docs and validation test
+
+New schema/StoredCardDetailsSchema.java, the same five fields with @Schema. Only sourceId is REQUIRED.
+In PaymentMethodSchema, add a field StoredCardDetailsSchema storedCard after networkToken.
+Register StoredCardDetails.class, StoredCardDetailsSchema.class in PaymentOpenApiConfig, and add StoredCardDetails.class to REQUEST_DTOS in DocSchemaTest.
+In PaymentApi’s table, add the row | STORED_CARD | storedCard | id (src_…) | shopper present: yes; merchant-initiated: no |.
+
+11. application.yml: masking rules
+
+yaml
+        - { path: paymentMethod.storedCard.sourceId,   strategy: LAST4 }
+        - { path: paymentMethod.storedCard.cvv,        strategy: FULL }
+        - { path: source.id,                           strategy: LAST4 }   # Checkout.com request and response
+        - { path: sourceId,                            strategy: LAST4 }   # our response
+
+Example requests
+
+jsonc
+// the shopper pays again with a saved card
+"paymentMethod": { "type": "STORED_CARD", "storedCard": { "sourceId": "src_…", "cvv": "100" } }
+
+// merchant-initiated (subscription renewal, no shopper)
+"paymentMethod": { "type": "STORED_CARD", "storedCard": { "sourceId": "src_…", "merchantInitiated": true,
+                   "paymentType": "RECURRING", "previousPaymentId": "pay_…" } }
+
+Things to check
+
+First payment of a subscription: that payment should already have payment_type Recurring, so later charges link to it. Today the first payment always sends Regular; add an optional paymentType to PaymentRequest if you need this.
+Which payments return source.id: card payments do. Whether network token and wallet payments return one depends on your Checkout.com account settings, so check what your sandbox returns for each.
