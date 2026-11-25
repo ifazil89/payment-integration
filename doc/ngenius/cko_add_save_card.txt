@@ -311,3 +311,136 @@ Things to check
 
 First payment of a subscription: that payment should already have payment_type Recurring, so later charges link to it. Today the first payment always sends Regular; add an optional paymentType to PaymentRequest if you need this.
 Which payments return source.id: card payments do. Whether network token and wallet payments return one depends on your Checkout.com account settings, so check what your sandbox returns for each.
+
+
+
+#######-----------
+
+Here is the stored-card change without the merchant-initiated (MIT) parts: the shopper is always present, and the request just carries the saved src_… id (plus an optional cvv). Below are only the pieces that change from my last answer. Steps 1–3 (saving source.id and returning it as sourceId) and the database migration stay the same, and none of this has been compiled or run.
+
+1. payment/dto/StoredCardDetails.java: replace the whole file
+
+java
+package com.company.checkout.payment.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Pattern;
+
+/**
+ * Pay again with a card Checkout.com stored on an earlier payment: the sourceId (src_...) returned in
+ * PaymentResponse.sourceId. The shopper is present: cvv optional, 3DS like a plain card.
+ */
+public record StoredCardDetails(
+        @NotBlank @Pattern(regexp = "^src_\\w+$", message = "must be a Checkout.com source id (src_...)")
+        String sourceId,
+        @Pattern(regexp = "\\d{3,4}", message = "must be 3 or 4 digits") String cvv) {
+
+    @Override
+    public String toString() {
+        return "StoredCardDetails[sourceId=****" + (sourceId == null ? null : sourceId.substring(Math.max(0, sourceId.length() - 4)))
+                + ", cvv=" + (cvv == null ? null : "***") + "]";
+    }
+}
+
+2. cko/dto/CkoPaymentRequest.java: no change. Don’t add merchant_initiated or previous_payment_id.
+
+3. payment/service/ResolvedPaymentMethod.java: add only sourceId at the end, plus a constructor with the old argument list
+
+java
+        String walletCurrencyNumeric,
+        String sourceId) {               // STORED_CARD: src_...
+
+    /** All payment methods except STORED_CARD. */
+    public ResolvedPaymentMethod(PaymentMethodType type, AuthMethod authMethod, String number, int expiryMonth,
+                                 int expiryYear, String cvv, String cryptogram, String eci, String tokenType,
+                                 String cardholderName, boolean threeDs, String walletTransactionId,
+                                 Long walletAmountMinor, String walletCurrencyNumeric) {
+        this(type, authMethod, number, expiryMonth, expiryYear, cvv, cryptogram, eci, tokenType, cardholderName,
+                threeDs, walletTransactionId, walletAmountMinor, walletCurrencyNumeric, null);
+    }
+
+    public boolean isStoredCard() {
+        return sourceId != null;
+    }
+
+In last4(), return null when number is null.
+
+4. payment/service/PaymentMethodResolver.java
+
+In validate, only the presence check:
+
+java
+        expect(errors, "paymentMethod.storedCard", method.storedCard() != null,
+                type == PaymentMethodType.STORED_CARD, type);
+
+In resolve:
+
+java
+            case STORED_CARD -> fromStoredCard(method.storedCard());
+
+Add this method, plus import com.company.checkout.payment.dto.StoredCardDetails;:
+
+java
+    /** Stored card, shopper present: card source by id, 3DS like a plain card (cko.three-ds-for-cards). */
+    private ResolvedPaymentMethod fromStoredCard(StoredCardDetails stored) {
+        return new ResolvedPaymentMethod(PaymentMethodType.STORED_CARD, AuthMethod.PAN_ONLY, null, 0, 0,
+                stored.cvv(), null, null, null, null, ckoProperties.threeDsForCards(), null, null, null,
+                stored.sourceId());
+    }
+
+5. payment/mapper/PaymentCkoMapper.java: only the source changes; "Regular" and the rest of the request stay as they are
+
+java
+        CkoSource source;
+        if (method.isStoredCard()) {
+            source = CkoSource.storedCard(method.sourceId(), method.cvv());
+        } else if (method.isNetworkToken()) {
+            source = CkoSource.networkToken(method.number(), method.tokenType(), method.expiryMonth(),
+                    method.expiryYear(), method.cryptogram(), method.eci(), address);
+        } else {
+            source = CkoSource.card(method.number(), method.expiryMonth(), method.expiryYear(), method.cvv(),
+                    method.cardholderName() != null ? method.cardholderName() : fullName(request.billingInfo()),
+                    address);
+        }
+
+CkoSource.storedCard(sourceId, cvv) and the extra id field in CkoSource are the same as last time.
+
+6. payment/service/PaymentService.java
+
+The ownership check stays exactly as before (existsByClientIdAndCkoSourceId → 422 STORED_CARD_NOT_FOUND).
+
+In secretPart(...):
+
+java
+            case STORED_CARD -> m.storedCard().sourceId();
+
+7. API docs: StoredCardDetailsSchema has two fields
+
+java
+@Schema(name = "StoredCardDetails", description = "A card Checkout.com stored on an earlier payment of this client")
+public record StoredCardDetailsSchema(
+
+        @Schema(requiredMode = Schema.RequiredMode.REQUIRED, example = "src_wmlfc3zyhqzehihu7giusaaawu",
+                description = "PaymentResponse.sourceId of an earlier payment")
+        String sourceId,
+
+        @Schema(pattern = "^\\d{3,4}$", example = "100", description = "Optional; ask the shopper again if you can")
+        String cvv) {
+}
+
+The table row in PaymentApi becomes | STORED_CARD | storedCard | id (src_…) + cvv | yes (cko.three-ds-for-cards) |.
+
+8. Masking rules: drop nothing; these four stay
+
+yaml
+        - { path: paymentMethod.storedCard.sourceId,   strategy: LAST4 }
+        - { path: paymentMethod.storedCard.cvv,        strategy: FULL }
+        - { path: source.id,                           strategy: LAST4 }
+        - { path: sourceId,                            strategy: LAST4 }
+
+Request
+
+json
+"paymentMethod": { "type": "STORED_CARD", "storedCard": { "sourceId": "src_wmlfc3zyhqzehihu7giusaaawu", "cvv": "100" } }
+
+Checkout.com receives "source": {"type": "id", "id": "src_…", "cvv": "100"}, with payment_type: "Regular" and 3DS on. As with a plain card, the response is then CHALLENGE_REQUIRED with a threeDsRedirectUrl, unless you turn off cko.three-ds-for-cards.
