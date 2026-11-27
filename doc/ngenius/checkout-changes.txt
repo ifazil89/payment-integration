@@ -371,3 +371,114 @@ Apple Pay key loaded from apple-pay.p12: merchant merchant.com.company.shop, pub
 If that line shows your merchant id, the .p12 is the right one. You can then leave APPLE_PAY_MERCHANT_ID unset.
 If you do set it, it acts as a check: startup stops when the .p12 belongs to a different merchant.
 If the .p12 holds the Merchant Identity Certificate (the one for Apple Pay on the web), startup stops. That certificate isn’t the one used to decrypt tokens. (In my test I didn’t check whether it has this extension; if it does, the RSA-key check in WalletKeys catches it firs
+
+
+
+##### Json masking
+
+This is the JsonNode version. Only SensitiveDataMasker and one test change: the rules, application.yml, the strategies, the baseline and the masker’s public methods stay the same. I haven’t compiled or run it: the method names are Jackson 3’s, and I wrote them from memory rather than checking against the library.
+
+common/logging/SensitiveDataMasker.java
+
+1. Delete the whole JSON scanner section: the inner classes InvalidJson and Scanner, plus the static methods unescape(...) and escape(...). Also delete the MAX_DEPTH constant. Everything else stays: the rules, CompiledRule, body(...), mask(...), headers(...), truncate(...) and isText(...).
+
+2. Add these imports:
+
+java
+import tools.jackson.core.JacksonException;
+import tools.jackson.core.StreamReadConstraints;
+import tools.jackson.core.json.JsonFactory;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
+import tools.jackson.databind.node.ArrayNode;
+import tools.jackson.databind.node.ObjectNode;
+
+import java.util.Map;
+
+3. Add a mapper of its own (independent of Spring’s), next to the other constants:
+
+java
+    /**
+     * Own mapper for masking only: max 64 levels deep, and nothing allowed after the document.
+     * Anything it cannot parse is not logged.
+     */
+    private static final JsonMapper JSON = JsonMapper.builder(JsonFactory.builder()
+                    .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(64).build())
+                    .build())
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .build();
+
+4. Replace maskJson(...) and add the two helpers:
+
+java
+    /** Masks a JSON document by path. Invalid JSON is not returned at all (it could hide anything). */
+    public String maskJson(String json) {
+        if (json == null || json.isBlank()) {
+            return json;
+        }
+        try {
+            JsonNode root = JSON.readTree(json);
+            maskChildren(root, new ArrayList<>());
+            return JSON.writeValueAsString(root);
+        } catch (JacksonException ex) {
+            return "[invalid JSON, " + json.length() + " chars, not logged]";
+        }
+    }
+
+    /**
+     * Walks the tree with the current path (lower-case field names; arrays add no step).
+     * A field whose path matches a rule is replaced with its masked text; its children are not visited.
+     */
+    private void maskChildren(JsonNode node, List<String> path) {
+        if (node instanceof ObjectNode object) {
+            for (Map.Entry<String, JsonNode> field : new ArrayList<>(object.properties())) {
+                path.add(field.getKey().toLowerCase(Locale.ROOT));
+                MaskStrategy strategy = strategyFor(path);
+                JsonNode value = field.getValue();
+                if (strategy == null) {
+                    maskChildren(value, path);
+                } else if (!value.isNull()) {                  // null stays null: "was it sent?" stays visible
+                    object.put(field.getKey(), maskedText(value, strategy));
+                }
+                path.removeLast();
+            }
+        } else if (node instanceof ArrayNode array) {
+            for (JsonNode element : array) {
+                maskChildren(element, path);
+            }
+        }
+    }
+
+    /** Objects and arrays -> "***"; strings and numbers -> the strategy applied to their text. */
+    private static String maskedText(JsonNode value, MaskStrategy strategy) {
+        if (value.isContainer()) {
+            return MASK;
+        }
+        return strategy.apply(value.isString() ? value.stringValue() : value.asString());
+    }
+
+How it works:
+
+Read: readTree turns the body into a tree.
+Walk: maskChildren goes through it, keeping the current path. When a field’s path matches a rule, object.put(...) replaces its value with the masked string.
+Write: writeValueAsString turns the tree back into a string.
+Arrays: they don’t add a step to the path, so items.card.number still matches every element.
+Bad JSON: invalid JSON, nesting deeper than 64 levels, or extra content after the document makes readTree throw, so the body is not logged.
+
+If isString(), stringValue() or asString() don’t compile, your Jackson version uses the older names isTextual(), textValue() and asText().
+
+SensitiveDataMaskerTest
+
+Jackson writes compact JSON, so spaces in the input aren’t kept. It also writes numbers in its own format: -1.5e3 becomes -1500.0. Only one test compares exact output with spaces and numbers, so replace it:
+
+java
+    @Test
+    void numbersAndEscapesAreHandled() {
+        assertThat(masker.maskJson("{ \"source\" : { \"number\" : 4111111111111111 } }"))
+                .isEqualTo("{\"source\":{\"number\":\"411111******1111\"}}");     // compact output
+        assertThat(masker.maskJson("{\"source\":{\"cvv\":\"1\\\"2\"},\"x\":[true,null,7]}"))
+                .isEqualTo("{\"source\":{\"cvv\":\"***\"},\"x\":[true,null,7]}");
+    }
+
+The other tests should pass unchanged, since their inputs are compact one-line JSON or they use contains.
